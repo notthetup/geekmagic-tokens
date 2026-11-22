@@ -48,7 +48,7 @@ where
                 let age = now - reading.at;
                 let footer = match problem {
                     Some(Problem::SignInAgain) => String::from("Sign in again"),
-                    _ if age > Duration::from_secs(180) => format!("Updated {} ago", span(age)),
+                    _ if age > Duration::from_secs(180) => format!("Updated {} ago", span(Duration::from_secs(age.as_secs() / 60 * 60))),
                     _ => ip.to_owned(),
                 };
                 footnote(target, &footer)?;
@@ -130,7 +130,7 @@ where
     Ok(())
 }
 
-/// Compact duration like the T3 chat badge: `4d 15h`, `4h 29m`, `12m`.
+/// Compact duration like the T3 chat badge: `4d 15h`, `4h 29m`, `12m`. Rounds up.
 fn span(d: Duration) -> String {
     let m = d.as_secs().div_ceil(60);
     match (m / 1440, m / 60 % 24, m % 60) {

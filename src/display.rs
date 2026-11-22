@@ -1,4 +1,8 @@
-use std::{thread, time::Duration};
+use std::{
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    thread,
+    time::Duration,
+};
 
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
 use embedded_hal::{digital::OutputPin, spi::SpiDevice};
@@ -8,6 +12,15 @@ use crate::{codex::State, ui::{self, Screen}};
 const WIDTH: usize = 240;
 const HEIGHT: usize = 240;
 const ROWS: usize = 8;
+
+/// Seconds since boot of the last full redraw and which screen it showed, for `GET /status`.
+/// (No 64-bit atomics on Xtensa.)
+pub static LAST_DRAW_S: AtomicU32 = AtomicU32::new(0);
+pub static SHOWING_CLAUDE: AtomicBool = AtomicBool::new(false);
+
+pub fn uptime_s() -> u32 {
+    (unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000) as u32
+}
 
 pub struct Display<Spi, Dc> {
     spi: Spi,
@@ -51,6 +64,8 @@ where
             self.dc.set_high()?;
             self.spi.write(&self.strip.pixels)?;
         }
+        LAST_DRAW_S.store(uptime_s(), Ordering::Relaxed);
+        SHOWING_CLAUDE.store(matches!(screen, Screen::Claude), Ordering::Relaxed);
         Ok(())
     }
 
@@ -94,4 +109,38 @@ impl DrawTarget for Strip {
         }
         Ok(())
     }
+}
+
+/// Renders what the panel would show as a top-down 24-bit BMP, one strip at a time.
+pub fn render_bmp<E>(
+    screen: Screen,
+    codex: &State,
+    ip: &str,
+    mut out: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    let row = WIDTH * 3;
+    let size = 54 + row * HEIGHT;
+    let mut header = [0u8; 54];
+    header[..2].copy_from_slice(b"BM");
+    header[2..6].copy_from_slice(&(size as u32).to_le_bytes());
+    header[10] = 54;
+    header[14] = 40;
+    header[18..22].copy_from_slice(&(WIDTH as i32).to_le_bytes());
+    header[22..26].copy_from_slice(&(-(HEIGHT as i32)).to_le_bytes());
+    header[26] = 1;
+    header[28] = 24;
+    out(&header)?;
+    let mut strip = Strip { y: 0, pixels: vec![0; WIDTH * ROWS * 2] };
+    let mut bgr = vec![0u8; row * ROWS];
+    for y in (0..HEIGHT).step_by(ROWS) {
+        strip.y = y as i32;
+        strip.pixels.fill(0);
+        let _ = ui::draw(&mut strip, screen, codex, ip);
+        for (px, rgb) in strip.pixels.chunks_exact(2).zip(bgr.chunks_exact_mut(3)) {
+            let c = Rgb565::from(embedded_graphics::pixelcolor::raw::RawU16::new(u16::from_be_bytes([px[0], px[1]])));
+            rgb.copy_from_slice(&[c.b() << 3, c.g() << 2, c.r() << 3]);
+        }
+        out(&bgr)?;
+    }
+    Ok(())
 }

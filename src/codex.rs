@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    sync::{mpsc::Receiver, Arc, Mutex},
+    sync::{atomic::Ordering, mpsc::Receiver, Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -60,7 +60,10 @@ impl State {
             None => format!("{name}: n/a\n"),
         };
         let mut out = format!(
-            "polls: {}\nproblem: {:?}\nlast error: {}\n",
+            "uptime: {}s\nlast redraw: {}s ago ({})\npolls: {}\nproblem: {:?}\nlast error: {}\n",
+            crate::display::uptime_s(),
+            crate::display::uptime_s() - crate::display::LAST_DRAW_S.load(Ordering::Relaxed),
+            if crate::display::SHOWING_CLAUDE.load(Ordering::Relaxed) { "Claude" } else { "Codex" },
             self.version,
             self.problem,
             LAST_ERROR.lock().unwrap()
@@ -101,6 +104,10 @@ pub fn save_auth(nvs: &EspDefaultNvsPartition, body: &[u8]) -> Result<(), Box<dy
 pub fn run(nvs: EspDefaultNvsPartition, state: Shared, wake: Receiver<()>) {
     let mut access: Option<String> = None;
     loop {
+        if PAUSED_UNTIL.lock().unwrap().is_some_and(|until| Instant::now() < until) {
+            let _ = wake.recv_timeout(Duration::from_secs(5));
+            continue;
+        }
         let result = poll(&nvs, &mut access);
         {
             let mut s = state.lock().unwrap();
@@ -265,6 +272,13 @@ fn request(
         out.extend_from_slice(&chunk[..n]);
     }
     Ok((status, out))
+}
+
+/// Set by `/debug/pause` so a reading can go stale while Wi‑Fi stays up.
+static PAUSED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn pause(secs: u64) {
+    *PAUSED_UNTIL.lock().unwrap() = Some(Instant::now() + Duration::from_secs(secs));
 }
 
 /// Last failure, shown by `GET /status` since the device has no serial console.

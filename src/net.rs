@@ -23,7 +23,7 @@ use esp_idf_svc::{
     wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent},
 };
 
-use crate::codex;
+use crate::{codex, display, ui::Screen};
 
 /// Shared secret for the write endpoints, baked in at build time (see `.env`).
 const TOKEN: &str = env!("DEVICE_TOKEN");
@@ -101,6 +101,30 @@ pub fn start(
         Ok(())
     })?;
 
+    let (screen_state, ip_text) = (state.clone(), ip.to_string());
+    server.fn_handler("/debug/screen.bmp", Method::Get, move |req| -> Result<(), Box<dyn Error>> {
+        let screen = if display::SHOWING_CLAUDE.load(Ordering::Relaxed) {
+            Screen::Claude
+        } else {
+            Screen::Codex
+        };
+        let mut resp = req.into_response(200, None, &[("Content-Type", "image/bmp")])?;
+        let state = screen_state.lock().unwrap();
+        display::render_bmp(screen, &state, &ip_text, |bytes| resp.write_all(bytes))?;
+        Ok(())
+    })?;
+
+    server.fn_handler("/debug/pause", Method::Post, |req| -> Result<(), Box<dyn Error>> {
+        if !authorized(&req) {
+            return deny(req);
+        }
+        let secs = query_secs(req.uri());
+        codex::pause(secs);
+        req.into_ok_response()?
+            .write_all(format!("Polling paused for {secs}s\n").as_bytes())?;
+        Ok(())
+    })?;
+
     server.fn_handler("/status", Method::Get, move |req| -> Result<(), Box<dyn Error>> {
         let text = state.lock().unwrap().describe();
         req.into_ok_response()?.write_all(text.as_bytes())?;
@@ -112,11 +136,7 @@ pub fn start(
         if !authorized(&req) {
             return deny(req);
         }
-        let secs: u64 = req
-            .uri()
-            .split_once("secs=")
-            .and_then(|(_, n)| n.parse().ok())
-            .unwrap_or(0);
+        let secs = query_secs(req.uri());
         req.into_ok_response()?
             .write_all(format!("Dropping Wi-Fi for {secs}s\n").as_bytes())?;
         thread::spawn(move || {
@@ -153,6 +173,10 @@ pub fn start(
     })?;
 
     Ok(Net { ip, _wifi: wifi, _server: server, _reconnect: reconnect })
+}
+
+fn query_secs(uri: &str) -> u64 {
+    uri.split_once("secs=").and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
 }
 
 fn authorized(req: &Request<&mut EspHttpConnection>) -> bool {

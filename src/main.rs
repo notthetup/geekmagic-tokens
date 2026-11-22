@@ -96,13 +96,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Redraw on a tap, on new data, and every 30 s so countdowns tick.
     let mut drawn = (u32::MAX, Instant::now());
     loop {
-        let tapped = button.update(touch.read()?);
+        // Errors here must not end `main`: the screen would freeze while Wi‑Fi and HTTP live on.
+        let tapped = touch.read().is_ok_and(|sample| button.update(sample));
         if tapped {
             screen = screen.toggle();
         }
         let state = codex.lock().unwrap();
         if tapped || state.version != drawn.0 || drawn.1.elapsed() > Duration::from_secs(30) {
-            display.draw(screen, &state, &ip)?;
+            if let Err(err) = display.draw(screen, &state, &ip) {
+                log::error!("draw failed: {err}");
+            }
             drawn = (state.version, Instant::now());
         }
         drop(state);
