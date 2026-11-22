@@ -34,11 +34,13 @@ impl Screen {
     }
 }
 
-pub fn draw<D>(target: &mut D, screen: Screen, codex: &State, ip: &str) -> Result<(), D::Error>
+pub fn draw<D>(target: &mut D, screen: Screen, codex: &State) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
     let heading = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
+    let ip = codex.ip.map_or_else(|| String::from("Connecting..."), |ip| ip.to_string());
+    let ip = ip.as_str();
     let (title, logo) = match screen {
         Screen::Codex => ("Codex", CODEX_LOGO),
         Screen::Claude => ("Claude Code", CLAUDE_CODE_LOGO),

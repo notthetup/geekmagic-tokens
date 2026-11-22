@@ -57,8 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut display = Display::new(spi, PinDriver::output(pins.gpio2)?)?;
     let mut screen = Screen::Codex;
     let codex = codex::Shared::default();
-    let mut ip = String::from("Connecting...");
-    display.draw(screen, &codex.lock().unwrap(), &ip)?;
+    display.draw(screen, &codex.lock().unwrap())?;
     backlight.set_high()?;
     let touch = TouchPad::new()?;
     let mut samples = [0; 21];
@@ -69,29 +68,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     samples.sort_unstable();
     let mut button = Button::new(samples[samples.len() / 2]);
 
-    // Wi‑Fi credentials are baked in at build time: WIFI_SSID=... WIFI_PASS=... cargo build
-    let nvs = EspDefaultNvsPartition::take()?;
-    let (wake, woken) = mpsc::channel();
-    let _net = match (option_env!("WIFI_SSID"), option_env!("WIFI_PASS")) {
-        (Some(ssid), Some(password)) => {
-            match net::start(peripherals.modem, ssid, password, nvs.clone(), wake, codex.clone()) {
-                Ok(net) => {
-                    ip = net.ip.to_string();
-                    let state = codex.clone();
-                    thread::Builder::new()
-                        .stack_size(24 * 1024)
-                        .spawn(move || codex::run(nvs, state, woken))?;
-                    Some(net)
-                }
-                Err(err) => {
-                    log::error!("Wi-Fi unavailable: {err}");
-                    ip = String::from("No Wi-Fi");
-                    None
-                }
+    // Wi‑Fi and polling share one background thread so the button works while we connect.
+    // Credentials are baked in at build time from .env.
+    if let (Some(ssid), Some(password)) = (option_env!("WIFI_SSID"), option_env!("WIFI_PASS")) {
+        let (nvs, state, modem) = (EspDefaultNvsPartition::take()?, codex.clone(), peripherals.modem);
+        thread::Builder::new().stack_size(24 * 1024).spawn(move || {
+            let (wake, woken) = mpsc::channel();
+            match net::start(modem, ssid, password, nvs.clone(), wake, state.clone()) {
+                // `run` never returns, so `_net` keeps Wi‑Fi and the HTTP server alive.
+                Ok(_net) => codex::run(nvs, state, woken),
+                Err(err) => log::error!("Wi-Fi unavailable: {err}"),
             }
-        }
-        _ => None,
-    };
+        })?;
+    }
 
     // Redraw on a tap, on new data, and every 30 s so countdowns tick.
     let mut drawn = (u32::MAX, Instant::now());
@@ -103,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let state = codex.lock().unwrap();
         if tapped || state.version != drawn.0 || drawn.1.elapsed() > Duration::from_secs(30) {
-            if let Err(err) = display.draw(screen, &state, &ip) {
+            if let Err(err) = display.draw(screen, &state) {
                 log::error!("draw failed: {err}");
             }
             drawn = (state.version, Instant::now());

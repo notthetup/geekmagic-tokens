@@ -53,12 +53,12 @@ where
         Ok(display)
     }
 
-    pub fn draw(&mut self, screen: Screen, codex: &State, ip: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn draw(&mut self, screen: Screen, codex: &State) -> Result<(), Box<dyn std::error::Error>> {
         self.command(0x2a, &[0, 0, 0, (WIDTH - 1) as u8])?;
         for y in (0..HEIGHT).step_by(ROWS) {
             self.strip.y = y as i32;
             self.strip.pixels.fill(0);
-            ui::draw(&mut self.strip, screen, codex, ip)?;
+            ui::draw(&mut self.strip, screen, codex)?;
             self.command(0x2b, &[0, y as u8, 0, (y + ROWS - 1) as u8])?;
             self.command(0x2c, &[])?;
             self.dc.set_high()?;
@@ -115,7 +115,6 @@ impl DrawTarget for Strip {
 pub fn render_bmp<E>(
     screen: Screen,
     codex: &State,
-    ip: &str,
     mut out: impl FnMut(&[u8]) -> Result<(), E>,
 ) -> Result<(), E> {
     let row = WIDTH * 3;
@@ -135,7 +134,7 @@ pub fn render_bmp<E>(
     for y in (0..HEIGHT).step_by(ROWS) {
         strip.y = y as i32;
         strip.pixels.fill(0);
-        let _ = ui::draw(&mut strip, screen, codex, ip);
+        let _ = ui::draw(&mut strip, screen, codex);
         for (px, rgb) in strip.pixels.chunks_exact(2).zip(bgr.chunks_exact_mut(3)) {
             let c = Rgb565::from(embedded_graphics::pixelcolor::raw::RawU16::new(u16::from_be_bytes([px[0], px[1]])));
             rgb.copy_from_slice(&[c.b() << 3, c.g() << 2, c.r() << 3]);

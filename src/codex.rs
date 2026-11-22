@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    net::Ipv4Addr,
     sync::{atomic::Ordering, mpsc::Receiver, Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -39,8 +40,18 @@ pub enum Problem {
     Offline,
 }
 
+/// Reasons to poll before the next scheduled minute.
+pub enum Wake {
+    /// New credentials arrived on `POST /auth`; drop the cached access token.
+    NewAuth,
+    /// Wi‑Fi came back after a drop.
+    Online,
+}
+
 #[derive(Default)]
 pub struct State {
+    /// Set once Wi‑Fi is up; `None` means still connecting.
+    pub ip: Option<Ipv4Addr>,
     pub reading: Option<Reading>,
     pub problem: Option<Problem>,
     pub version: u32,
@@ -68,6 +79,7 @@ impl State {
             self.problem,
             LAST_ERROR.lock().unwrap()
         );
+        out += &crate::net::wifi_summary();
         match &self.reading {
             Some(r) => {
                 out += &format!("reading age: {}s\n", r.at.elapsed().as_secs());
@@ -100,12 +112,14 @@ pub fn save_auth(nvs: &EspDefaultNvsPartition, body: &[u8]) -> Result<(), Box<dy
     Ok(())
 }
 
-/// Polls usage forever. A message on `wake` (new credentials) polls immediately.
-pub fn run(nvs: EspDefaultNvsPartition, state: Shared, wake: Receiver<()>) {
+/// Polls usage forever. A message on `wake` polls immediately.
+pub fn run(nvs: EspDefaultNvsPartition, state: Shared, wake: Receiver<Wake>) {
     let mut access: Option<String> = None;
     loop {
         if PAUSED_UNTIL.lock().unwrap().is_some_and(|until| Instant::now() < until) {
-            let _ = wake.recv_timeout(Duration::from_secs(5));
+            if let Ok(Wake::NewAuth) = wake.recv_timeout(Duration::from_secs(5)) {
+                access = None;
+            }
             continue;
         }
         let result = poll(&nvs, &mut access);
@@ -115,12 +129,13 @@ pub fn run(nvs: EspDefaultNvsPartition, state: Shared, wake: Receiver<()>) {
                 Ok(reading) => {
                     s.reading = Some(reading);
                     s.problem = None;
+                    LAST_ERROR.lock().unwrap().clear();
                 }
                 Err(problem) => s.problem = Some(problem),
             }
             s.version += 1;
         }
-        if wake.recv_timeout(POLL).is_ok() {
+        if let Ok(Wake::NewAuth) = wake.recv_timeout(POLL) {
             access = None;
         }
     }

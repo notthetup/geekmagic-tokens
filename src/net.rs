@@ -1,8 +1,8 @@
 use std::{
     error::Error,
-    net::Ipv4Addr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Mutex,
         mpsc::Sender,
     },
     thread,
@@ -20,6 +20,7 @@ use esp_idf_svc::{
     nvs::EspDefaultNvsPartition,
     ota::EspOta,
     sys,
+    netif::IpEvent,
     wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent},
 };
 
@@ -28,15 +29,32 @@ use crate::{codex, display, ui::Screen};
 /// Shared secret for the write endpoints, baked in at build time (see `.env`).
 const TOKEN: &str = env!("DEVICE_TOKEN");
 
+/// Boot-time Wi‑Fi join stats for `GET /status`.
+static WIFI_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static WIFI_UP_S: AtomicU32 = AtomicU32::new(0);
+static WIFI_LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+
+pub fn wifi_summary() -> String {
+    format!(
+        "wifi: joined at {}s after {} attempt(s){}\n",
+        WIFI_UP_S.load(Ordering::Relaxed),
+        WIFI_ATTEMPTS.load(Ordering::Relaxed),
+        match WIFI_LAST_ERROR.lock().unwrap().as_str() {
+            "" => String::new(),
+            err => format!(", last failure: {err}"),
+        }
+    )
+}
+
 /// Set by `/debug/drop` to keep the device offline for a while.
 static HOLD_OFFLINE: AtomicBool = AtomicBool::new(false);
 
 /// Keeps Wi‑Fi and the OTA server alive for as long as it is held.
 pub struct Net {
-    pub ip: Ipv4Addr,
     _wifi: BlockingWifi<EspWifi<'static>>,
     _server: EspHttpServer<'static>,
     _reconnect: EspSubscription<'static, System>,
+    _online: EspSubscription<'static, System>,
 }
 
 pub fn start(
@@ -44,7 +62,7 @@ pub fn start(
     ssid: &str,
     password: &str,
     nvs: EspDefaultNvsPartition,
-    wake: Sender<()>,
+    wake: Sender<codex::Wake>,
     state: codex::Shared,
 ) -> Result<Net, Box<dyn Error>> {
     let sysloop = EspSystemEventLoop::take()?;
@@ -58,18 +76,36 @@ pub fn start(
         ..Default::default()
     }))?;
     wifi.start()?;
-    while let Err(err) = wifi.connect() {
-        log::warn!("Wi-Fi connect failed, retrying: {err}");
-        thread::sleep(Duration::from_secs(5));
+    // Keep trying until we have an address; giving up would leave the device offline for good.
+    loop {
+        let attempt = WIFI_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+        match wifi.connect().and_then(|_| wifi.wait_netif_up()) {
+            Ok(()) => break,
+            Err(err) => {
+                log::warn!("Wi-Fi attempt {attempt} failed: {err}");
+                *WIFI_LAST_ERROR.lock().unwrap() = err.to_string();
+                let _ = wifi.disconnect();
+                thread::sleep(Duration::from_secs(3));
+            }
+        }
     }
-    wifi.wait_netif_up()?;
+    WIFI_UP_S.store(display::uptime_s(), Ordering::Relaxed);
     let ip = wifi.wifi().sta_netif().get_ip_info()?.ip;
+    state.lock().unwrap().ip = Some(ip);
 
     // ESP-IDF does not rejoin on its own after the access point drops us.
     let reconnect = sysloop.subscribe::<WifiEvent, _>(|event| {
         if matches!(event, WifiEvent::StaDisconnected(_)) && !HOLD_OFFLINE.load(Ordering::Relaxed) {
             log::warn!("Wi-Fi dropped, reconnecting");
             unsafe { sys::esp_wifi_connect() };
+        }
+    })?;
+    // Poll as soon as we are back instead of waiting out the minute.
+    let (online_state, online_wake) = (state.clone(), wake.clone());
+    let online = sysloop.subscribe::<IpEvent, _>(move |event| {
+        if let IpEvent::DhcpIpAssigned(assignment) = event {
+            online_state.lock().unwrap().ip = Some(assignment.ip());
+            let _ = online_wake.send(codex::Wake::Online);
         }
     })?;
 
@@ -101,7 +137,7 @@ pub fn start(
         Ok(())
     })?;
 
-    let (screen_state, ip_text) = (state.clone(), ip.to_string());
+    let screen_state = state.clone();
     server.fn_handler("/debug/screen.bmp", Method::Get, move |req| -> Result<(), Box<dyn Error>> {
         let screen = if display::SHOWING_CLAUDE.load(Ordering::Relaxed) {
             Screen::Claude
@@ -110,7 +146,7 @@ pub fn start(
         };
         let mut resp = req.into_response(200, None, &[("Content-Type", "image/bmp")])?;
         let state = screen_state.lock().unwrap();
-        display::render_bmp(screen, &state, &ip_text, |bytes| resp.write_all(bytes))?;
+        display::render_bmp(screen, &state, |bytes| resp.write_all(bytes))?;
         Ok(())
     })?;
 
@@ -172,12 +208,12 @@ pub fn start(
             body.extend_from_slice(&buf[..n]);
         }
         codex::save_auth(&nvs, &body)?;
-        let _ = wake.send(());
+        let _ = wake.send(codex::Wake::NewAuth);
         req.into_ok_response()?.write_all(b"Saved\n")?;
         Ok(())
     })?;
 
-    Ok(Net { ip, _wifi: wifi, _server: server, _reconnect: reconnect })
+    Ok(Net { _wifi: wifi, _server: server, _reconnect: reconnect, _online: online })
 }
 
 fn query(uri: &str, key: &str) -> u64 {
