@@ -1,4 +1,13 @@
-use std::{error::Error, net::Ipv4Addr, sync::mpsc::Sender, thread, time::Duration};
+use std::{
+    error::Error,
+    net::Ipv4Addr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+    },
+    thread,
+    time::Duration,
+};
 
 use esp_idf_svc::{
     eventloop::{EspSubscription, EspSystemEventLoop, System},
@@ -18,6 +27,9 @@ use crate::codex;
 
 /// Shared secret for the write endpoints, baked in at build time (see `.env`).
 const TOKEN: &str = env!("DEVICE_TOKEN");
+
+/// Set by `/debug/drop` to keep the device offline for a while.
+static HOLD_OFFLINE: AtomicBool = AtomicBool::new(false);
 
 /// Keeps Wi‑Fi and the OTA server alive for as long as it is held.
 pub struct Net {
@@ -55,7 +67,7 @@ pub fn start(
 
     // ESP-IDF does not rejoin on its own after the access point drops us.
     let reconnect = sysloop.subscribe::<WifiEvent, _>(|event| {
-        if matches!(event, WifiEvent::StaDisconnected(_)) {
+        if matches!(event, WifiEvent::StaDisconnected(_)) && !HOLD_OFFLINE.load(Ordering::Relaxed) {
             log::warn!("Wi-Fi dropped, reconnecting");
             unsafe { sys::esp_wifi_connect() };
         }
@@ -92,6 +104,31 @@ pub fn start(
     server.fn_handler("/status", Method::Get, move |req| -> Result<(), Box<dyn Error>> {
         let text = state.lock().unwrap().describe();
         req.into_ok_response()?.write_all(text.as_bytes())?;
+        Ok(())
+    })?;
+
+    // `POST /debug/drop?secs=N` drops Wi‑Fi and stays offline for N seconds, to test recovery.
+    server.fn_handler("/debug/drop", Method::Post, |req| -> Result<(), Box<dyn Error>> {
+        if !authorized(&req) {
+            return deny(req);
+        }
+        let secs: u64 = req
+            .uri()
+            .split_once("secs=")
+            .and_then(|(_, n)| n.parse().ok())
+            .unwrap_or(0);
+        req.into_ok_response()?
+            .write_all(format!("Dropping Wi-Fi for {secs}s\n").as_bytes())?;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            HOLD_OFFLINE.store(secs > 0, Ordering::Relaxed);
+            unsafe { sys::esp_wifi_disconnect() };
+            if secs > 0 {
+                thread::sleep(Duration::from_secs(secs));
+                HOLD_OFFLINE.store(false, Ordering::Relaxed);
+                unsafe { sys::esp_wifi_connect() };
+            }
+        });
         Ok(())
     })?;
 
