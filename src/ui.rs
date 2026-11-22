@@ -1,17 +1,23 @@
 use std::time::{Duration, Instant};
 
 use embedded_graphics::{
+    image::{Image, ImageRaw},
     mono_font::{
         ascii::{FONT_10X20, FONT_8X13},
         MonoTextStyle,
     },
-    pixelcolor::Rgb565,
+    pixelcolor::{raw::BigEndian, Rgb565},
     prelude::*,
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text},
 };
 
 use crate::codex::{Problem, State, Window};
+
+const LOGO: u32 = 32;
+// 32×32 big-endian RGB565, made by scripts/logo.swift from assets/*.svg.
+const CODEX_LOGO: &[u8] = include_bytes!("../assets/codex.raw");
+const CLAUDE_CODE_LOGO: &[u8] = include_bytes!("../assets/claude-code.raw");
 
 #[derive(Clone, Copy)]
 pub enum Screen {
@@ -33,11 +39,13 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     let heading = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    let title = match screen {
-        Screen::Codex => "Codex",
-        Screen::Claude => "Claude",
+    let (title, logo) = match screen {
+        Screen::Codex => ("Codex", CODEX_LOGO),
+        Screen::Claude => ("Claude Code", CLAUDE_CODE_LOGO),
     };
     Text::with_baseline(title, Point::new(16, 19), heading, Baseline::Top).draw(target)?;
+    let logo = ImageRaw::<Rgb565, BigEndian>::new(logo, LOGO);
+    Image::new(&logo, Point::new(224 - LOGO as i32, 13)).draw(target)?;
 
     match screen {
         Screen::Codex => match (&codex.reading, codex.problem) {
