@@ -1,8 +1,11 @@
+mod backlight;
+mod claude;
 mod codex;
 mod display;
 mod net;
 mod touch;
 mod ui;
+mod usage;
 
 use std::{
     sync::mpsc,
@@ -46,8 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .data_mode(MODE_3),
     )?;
     let mut reset = PinDriver::output(pins.gpio4)?;
-    let mut backlight = PinDriver::output(pins.gpio21)?;
-    backlight.set_low()?;
+    let mut backlight =
+        backlight::Backlight::new(peripherals.ledc.channel0, peripherals.ledc.timer0, pins.gpio21)?;
     reset.set_low()?;
     thread::sleep(Duration::from_millis(20));
     reset.set_high()?;
@@ -56,9 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start calibrating with the backlight in its normal operating state.
     let mut display = Display::new(spi, PinDriver::output(pins.gpio2)?)?;
     let mut screen = Screen::Codex;
-    let codex = codex::Shared::default();
+    let codex = usage::Shared::default();
     display.draw(screen, &codex.lock().unwrap())?;
-    backlight.set_high()?;
+    backlight.update()?;
     let touch = TouchPad::new()?;
     let mut samples = [0; 21];
     for sample in &mut samples {
@@ -76,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (wake, woken) = mpsc::channel();
             match net::start(modem, ssid, password, nvs.clone(), wake, state.clone()) {
                 // `run` never returns, so `_net` keeps Wi‑Fi and the HTTP server alive.
-                Ok(_net) => codex::run(nvs, state, woken),
+                Ok(_net) => usage::run(nvs, state, woken),
                 Err(err) => log::error!("Wi-Fi unavailable: {err}"),
             }
         })?;
@@ -96,6 +99,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::error!("draw failed: {err}");
             }
             drawn = (state.version, Instant::now());
+            if let Err(err) = backlight.update() {
+                log::error!("backlight: {err}");
+            }
         }
         drop(state);
         thread::sleep(Duration::from_millis(15));

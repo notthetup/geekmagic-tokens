@@ -12,7 +12,7 @@ use embedded_graphics::{
     text::{Alignment, Baseline, Text},
 };
 
-use crate::codex::{Problem, State, Window};
+use crate::usage::{Problem, State, Window};
 
 const LOGO: u32 = 32;
 // 32×32 big-endian RGB565, made by scripts/logo.swift from assets/*.svg.
@@ -34,12 +34,12 @@ impl Screen {
     }
 }
 
-pub fn draw<D>(target: &mut D, screen: Screen, codex: &State) -> Result<(), D::Error>
+pub fn draw<D>(target: &mut D, screen: Screen, state: &State) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
     let heading = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
-    let ip = codex.ip.map_or_else(|| String::from("Connecting..."), |ip| ip.to_string());
+    let ip = state.ip.map_or_else(|| String::from("Connecting..."), |ip| ip.to_string());
     let ip = ip.as_str();
     let (title, logo) = match screen {
         Screen::Codex => ("Codex", CODEX_LOGO),
@@ -49,34 +49,37 @@ where
     let logo = ImageRaw::<Rgb565, BigEndian>::new(logo, LOGO);
     Image::new(&logo, Point::new(224 - LOGO as i32, 13)).draw(target)?;
 
-    match screen {
-        Screen::Codex => match (&codex.reading, codex.problem) {
-            (Some(reading), problem) => {
-                let now = Instant::now();
-                usage_bar(target, 62, "Session", reading.session, now)?;
-                usage_bar(target, 129, "Weekly", reading.weekly, now)?;
-                let age = now - reading.at;
-                let footer = match problem {
-                    Some(Problem::SignInAgain) => String::from("Sign in again"),
-                    _ if age > Duration::from_secs(180) => format!("Updated {} ago", span(Duration::from_secs(age.as_secs() / 60 * 60))),
-                    _ => ip.to_owned(),
-                };
-                footnote(target, &footer)?;
-            }
-            (None, problem) => {
-                message(
-                    target,
-                    match problem {
-                        Some(Problem::NotSignedIn) => "Not signed in",
-                        Some(Problem::SignInAgain) => "Sign in again",
-                        Some(Problem::Offline) => "Can't reach Codex",
-                        None => "Loading...",
-                    },
-                )?;
-                footnote(target, ip)?;
-            }
-        },
-        Screen::Claude => message(target, "Claude setup unavailable")?,
+    let (feed, service, stale_after) = match screen {
+        Screen::Codex => (&state.codex, "Codex", Duration::from_secs(180)),
+        // Claude polls every 5 minutes, so allow a bit more than one missed poll.
+        Screen::Claude => (&state.claude, "Claude", Duration::from_secs(420)),
+    };
+    match (&feed.reading, feed.problem) {
+        (Some(reading), problem) => {
+            let now = Instant::now();
+            usage_bar(target, 62, "Session", reading.session, now)?;
+            usage_bar(target, 129, "Weekly", reading.weekly, now)?;
+            let age = now - reading.at;
+            let footer = match problem {
+                Some(Problem::SignInAgain) => String::from("Sign in again"),
+                _ if age > stale_after => format!("Updated {} ago", span(Duration::from_secs(age.as_secs() / 60 * 60))),
+                _ => ip.to_owned(),
+            };
+            footnote(target, &footer)?;
+        }
+        (None, problem) => {
+            let offline = format!("Can't reach {service}");
+            message(
+                target,
+                match problem {
+                    Some(Problem::NotSignedIn) => "Not signed in",
+                    Some(Problem::SignInAgain) => "Sign in again",
+                    Some(Problem::Offline) => &offline,
+                    None => "Loading...",
+                },
+            )?;
+            footnote(target, ip)?;
+        }
     }
     Ok(())
 }

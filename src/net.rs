@@ -21,10 +21,11 @@ use esp_idf_svc::{
     ota::EspOta,
     sys,
     netif::IpEvent,
+    sntp::EspSntp,
     wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent},
 };
 
-use crate::{codex, display, ui::Screen};
+use crate::{claude, codex, display, ui::Screen, usage};
 
 /// Shared secret for the write endpoints, baked in at build time (see `.env`).
 const TOKEN: &str = env!("DEVICE_TOKEN");
@@ -55,6 +56,7 @@ pub struct Net {
     _server: EspHttpServer<'static>,
     _reconnect: EspSubscription<'static, System>,
     _online: EspSubscription<'static, System>,
+    _sntp: EspSntp<'static>,
 }
 
 pub fn start(
@@ -62,8 +64,8 @@ pub fn start(
     ssid: &str,
     password: &str,
     nvs: EspDefaultNvsPartition,
-    wake: Sender<codex::Wake>,
-    state: codex::Shared,
+    wake: Sender<usage::Wake>,
+    state: usage::Shared,
 ) -> Result<Net, Box<dyn Error>> {
     let sysloop = EspSystemEventLoop::take()?;
     let mut wifi = BlockingWifi::wrap(
@@ -93,6 +95,9 @@ pub fn start(
     let ip = wifi.wifi().sta_netif().get_ip_info()?.ip;
     state.lock().unwrap().ip = Some(ip);
 
+    // Network time drives the night dimming.
+    let sntp = EspSntp::new_default()?;
+
     // ESP-IDF does not rejoin on its own after the access point drops us.
     let reconnect = sysloop.subscribe::<WifiEvent, _>(|event| {
         if matches!(event, WifiEvent::StaDisconnected(_)) && !HOLD_OFFLINE.load(Ordering::Relaxed) {
@@ -105,7 +110,7 @@ pub fn start(
     let online = sysloop.subscribe::<IpEvent, _>(move |event| {
         if let IpEvent::DhcpIpAssigned(assignment) = event {
             online_state.lock().unwrap().ip = Some(assignment.ip());
-            let _ = online_wake.send(codex::Wake::Online);
+            let _ = online_wake.send(usage::Wake::Online);
         }
     })?;
 
@@ -157,12 +162,26 @@ pub fn start(
         }
         let secs = query(req.uri(), "secs");
         let age = query(req.uri(), "age");
-        codex::pause(secs);
-        if let Some(reading) = &mut pause_state.lock().unwrap().reading {
+        usage::pause(secs);
+        let mut state = pause_state.lock().unwrap();
+        let state = &mut *state;
+        for reading in [&mut state.codex.reading, &mut state.claude.reading].into_iter().flatten() {
             reading.at = reading.at.checked_sub(Duration::from_secs(age)).unwrap_or(reading.at);
         }
         req.into_ok_response()?
             .write_all(format!("Polling paused for {secs}s, reading aged {age}s\n").as_bytes())?;
+        Ok(())
+    })?;
+
+    // `POST /debug/brightness?percent=N` overrides the backlight; percent=0 follows the clock again.
+    server.fn_handler("/debug/brightness", Method::Post, |req| -> Result<(), Box<dyn Error>> {
+        if !authorized(&req) {
+            return deny(req);
+        }
+        let percent = query(req.uri(), "percent") as u32;
+        crate::backlight::OVERRIDE.store(percent, Ordering::Relaxed);
+        req.into_ok_response()?
+            .write_all(format!("Brightness override {percent}%\n").as_bytes())?;
         Ok(())
     })?;
 
@@ -194,26 +213,29 @@ pub fn start(
     })?;
 
     // `curl --data-binary @auth.json http://<ip>/auth` hands the device its own Codex login.
+    let (codex_nvs, codex_wake) = (nvs.clone(), wake.clone());
     server.fn_handler("/auth", Method::Post, move |mut req| -> Result<(), Box<dyn Error>> {
         if !authorized(&req) {
             return deny(req);
         }
-        let mut body = Vec::new();
-        let mut buf = [0; 512];
-        loop {
-            let n = req.read(&mut buf)?;
-            if n == 0 || body.len() > 16 * 1024 {
-                break;
-            }
-            body.extend_from_slice(&buf[..n]);
-        }
-        codex::save_auth(&nvs, &body)?;
-        let _ = wake.send(codex::Wake::NewAuth);
+        codex::save_auth(&codex_nvs, &read_body(&mut req)?)?;
+        let _ = codex_wake.send(usage::Wake::NewAuth);
         req.into_ok_response()?.write_all(b"Saved\n")?;
         Ok(())
     })?;
 
-    Ok(Net { _wifi: wifi, _server: server, _reconnect: reconnect, _online: online })
+    // `curl --data-binary @.device-auth/claude.json http://<ip>/auth/claude` hands over the Claude token.
+    server.fn_handler("/auth/claude", Method::Post, move |mut req| -> Result<(), Box<dyn Error>> {
+        if !authorized(&req) {
+            return deny(req);
+        }
+        claude::save_auth(&nvs, &read_body(&mut req)?)?;
+        let _ = wake.send(usage::Wake::NewAuth);
+        req.into_ok_response()?.write_all(b"Saved\n")?;
+        Ok(())
+    })?;
+
+    Ok(Net { _wifi: wifi, _server: server, _reconnect: reconnect, _online: online, _sntp: sntp })
 }
 
 fn query(uri: &str, key: &str) -> u64 {
@@ -222,6 +244,19 @@ fn query(uri: &str, key: &str) -> u64 {
         .split('&')
         .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
         .unwrap_or(0)
+}
+
+/// Reads a request body of up to 16 KB.
+fn read_body(req: &mut Request<&mut EspHttpConnection>) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut body = Vec::new();
+    let mut buf = [0; 512];
+    loop {
+        let n = req.read(&mut buf)?;
+        if n == 0 || body.len() > 16 * 1024 {
+            return Ok(body);
+        }
+        body.extend_from_slice(&buf[..n]);
+    }
 }
 
 fn authorized(req: &Request<&mut EspHttpConnection>) -> bool {

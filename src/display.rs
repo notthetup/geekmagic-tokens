@@ -7,7 +7,7 @@ use std::{
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
 use embedded_hal::{digital::OutputPin, spi::SpiDevice};
 
-use crate::{codex::State, ui::{self, Screen}};
+use crate::{ui::{self, Screen}, usage::State};
 
 const WIDTH: usize = 240;
 const HEIGHT: usize = 240;

@@ -1,12 +1,12 @@
 # geekmagic-tokens
 
-Rust firmware that turns a GeekMagic SmallTV Pro into a standalone Codex usage display. It joins Wi‑Fi, keeps its own Codex login, and polls the 5-hour session and weekly limits once a minute. No computer is needed once it is set up.
+Rust firmware that turns a GeekMagic SmallTV Pro into a standalone Codex and Claude Code usage display. It joins Wi‑Fi, keeps its own Codex and Claude logins, and polls the 5-hour session and weekly limits (Codex every minute, Claude every 5 minutes). No computer is needed once it is set up.
 
 ![Codex screen](docs/screen.png)
 
 - Bars show percent used, with a reset countdown in the corner (`3h 20m`, `4d 1h`).
-- A tap on the top of the case switches between the Codex and Claude Code screens. Claude Code is a placeholder until Anthropic offers an API the device can poll (see [docs/plan.md](docs/plan.md)).
-- The footer shows the device IP, or `Updated Xm ago` once the last reading is more than 3 minutes old.
+- A tap on the top of the case switches between the Codex and Claude Code screens.
+- The footer shows the device IP, or `Updated Xm ago` once the last reading is more than 3 minutes old (7 for Claude).
 
 ## Hardware
 
@@ -69,6 +69,18 @@ rm .device-auth/auth.json   # the device rotates the token straight away, so thi
 
 The device stores the refresh token in NVS, refreshes it itself, and saves each new one before using it. Repeat these steps if the screen says `Sign in again`.
 
+## Signing in to Claude
+
+The device reads the same numbers as Claude Code's `/usage`, from its own token:
+
+```sh
+scripts/claude-login.sh   # prints a sign-in link, asks for the code#state, checks the token
+. ./.env
+curl -H "X-Device-Token: $DEVICE_TOKEN" --data-binary @.device-auth/claude.json http://10.0.3.250/auth/claude
+```
+
+The script mints a 1-year access token with only the `user:profile` scope, so it can read usage but can't run models. The device never refreshes it: Claude's refresh chain expires about 30 days after sign-in, and a refresh would swap the 1-year token for an 8-hour one. Run the script again once a year, or when the Claude screen says `Sign in again`. The recipe comes from [claude-usage-epaper](https://github.com/Pharkie/claude-usage-epaper).
+
 ## Endpoints
 
 | Method and path | Token | What it does |
@@ -77,6 +89,8 @@ The device stores the refresh token in NVS, refreshes it itself, and saves each 
 | `GET /debug/screen.bmp` | no | Renders what the panel currently shows |
 | `POST /update` | yes | Raw app image (body) → OTA write and reboot |
 | `POST /auth` | yes | Codex `auth.json` (body) → stored in NVS, polls immediately |
+| `POST /auth/claude` | yes | `.device-auth/claude.json` (body) → access token stored in NVS, polls immediately |
+| `POST /debug/brightness?percent=N` | yes | Overrides the backlight; `percent=0` goes back to the day/night schedule |
 | `POST /debug/pause?secs=N&age=S` | yes | Stops polling for N seconds and backdates the reading by S seconds |
 | `POST /debug/drop?secs=N` | yes | Drops Wi‑Fi and holds off reconnecting for N seconds |
 
@@ -91,21 +105,26 @@ flowchart TB
         L --> D[display.rs<br/>ST7789, 8-row strips] --> U[ui.rs]
     end
     subgraph net thread
-        N[net.rs<br/>Wi-Fi + HTTP server] --> C[codex.rs<br/>refresh + poll]
+        N[net.rs<br/>Wi-Fi + HTTP server] --> P[usage.rs<br/>poll loop]
+        P --> C[codex.rs] & A[claude.rs]
     end
-    C -- shared State --> L
-    N -- /auth, reconnect --> C
+    P -- shared State --> L
+    N -- /auth, /auth/claude, reconnect --> P
     Mac -. ota.sh / curl .-> N
     C <-- HTTPS --> O[auth.openai.com<br/>chatgpt.com]
+    A <-- HTTPS --> K[api.anthropic.com]
 ```
 
 - `main.rs` sets up the panel and touch pad, then runs the draw loop: redraw on a tap, on new data, and every 30 s so countdowns tick. Wi‑Fi starts on a background thread so the button works while it connects.
 - `net.rs` joins Wi‑Fi (retrying until it has an address), rejoins after drops, and serves the endpoints.
+- `usage.rs` holds the shared state and polls Codex every minute and Claude every 5 minutes, one after the other so only one TLS session uses RAM at a time.
 - `codex.rs` refreshes the token at `auth.openai.com/oauth/token` and reads `chatgpt.com/backend-api/wham/usage`, the same endpoints and client ID the Codex CLI uses. `primary_window` is the session and `secondary_window` the weekly limit.
+- `claude.rs` reads `api.anthropic.com/api/oauth/usage` (`five_hour`, `seven_day`), the endpoint behind Claude Code's `/usage`. It sends a `claude-code/<version>` User-Agent, without which the endpoint throttles to about one request an hour.
+- `backlight.rs` dims the backlight with PWM: 70% by day, 10% from 22:00 to 07:00 Singapore time, once SNTP has set the clock.
 - `display.rs` drives the ST7789 directly and renders 8 rows at a time to leave RAM for TLS.
 - `ui.rs` draws the screens with `embedded-graphics`.
 
-The quota endpoint is internal to ChatGPT and could change without notice. If it does, `/status` will show the parse or HTTP error.
+Both quota endpoints are internal (ChatGPT's and Anthropic's) and could change without notice. If it does, `/status` will show the parse or HTTP error.
 
 ## Logos
 

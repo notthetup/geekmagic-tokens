@@ -1,12 +1,12 @@
 # Next steps plan
 
-Four items, done in this order: README, brightness, rate-limit display, Claude Code usage. Each item ends with an OTA push, a check through `/status` and `/debug/screen.bmp`, and a commit.
+Four items: README, brightness, Claude Code usage (moved ahead of the rate-limit display once a laptop-free route was accepted), rate-limit display. Each item ends with an OTA push, a check through `/status` and `/debug/screen.bmp`, and a commit.
 
 ```mermaid
 flowchart LR
     A[1. README] --> B[2. Brightness<br/>PWM + night dim]
-    B --> C[3. Rate-limit display<br/>amber / red bars]
-    C --> D[4. Claude Code<br/>placeholder, watch for API]
+    B --> D[3. Claude Code<br/>device-owned token, done]
+    D --> C[4. Rate-limit display<br/>amber / red bars, both screens]
 ```
 
 ## 1. README
@@ -57,7 +57,7 @@ stateDiagram-v2
     Night --> Day: 07:00
 ```
 
-## 3. Rate-limit display
+## 4. Rate-limit display
 
 `/wham/usage` already returns `rate_limit.allowed`, `rate_limit.limit_reached` and each window's `used_percent`.
 
@@ -67,11 +67,26 @@ stateDiagram-v2
 4. Add `limit reached: yes/no` to `/status`.
 5. Check: render a fake reading through a temporary debug hook, or wait for a real 80% session, and inspect `/debug/screen.bmp`.
 
-## 4. Claude Code usage
+## 3. Claude Code usage (done)
 
-Decision: keep the placeholder.
+The first decision was to keep the placeholder. No supported API exists for a Team seat: Team organizations can't use the Admin API, the Spend Limits API is Enterprise only, and the 5-hour and weekly numbers are documented only in Claude Code's status line. A push from the Mac was declined because the display must work without a laptop.
 
-The only supported source today is Claude Code's status line, which gives `rate_limits.five_hour` and `rate_limits.seven_day` (`used_percentage`, `resets_at`) to a script on the computer running Claude Code. The display can't fetch that on its own. A push from the Mac was considered and declined.
+The decision was then reversed in favour of the route [claude-usage-epaper](https://github.com/Pharkie/claude-usage-epaper) uses, accepting the same kind of risk as the Codex endpoint: the device polls `api.anthropic.com/api/oauth/usage` itself.
 
-1. No firmware work now. The screen keeps the Claude Code logo and "Claude setup unavailable".
-2. Revisit if Anthropic publishes an API the device can poll with its own credentials. The UI already has the bar and countdown code to reuse.
+1. `scripts/claude-login.sh` runs the OAuth + PKCE login with Claude Code's public client ID and mints a 1-year access token with only `user:profile`. Confirmed working for the Team seat.
+2. `POST /auth/claude` stores the access token in NVS (namespace `claude`). The device never refreshes it, because a refresh returns an 8-hour token and the refresh chain dies after about 30 days anyway.
+3. `claude.rs` polls every 5 minutes with a `claude-code/<version>` User-Agent and parses `five_hour` and `seven_day` (`utilization`, RFC 3339 `resets_at`). `usage.rs` runs both sources in one loop so only one TLS session is open at a time.
+4. A 401 or 403 shows `Sign in again`. Re-run the script yearly.
+
+```mermaid
+sequenceDiagram
+    participant Mac as Mac (once a year)
+    participant D as Display
+    participant A as api.anthropic.com
+    Mac->>Mac: scripts/claude-login.sh (browser sign-in)
+    Mac->>D: POST /auth/claude
+    loop every 5 min
+        D->>A: GET /api/oauth/usage
+        A-->>D: five_hour, seven_day
+    end
+```
