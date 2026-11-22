@@ -2,3 +2,4 @@
 /.embuild/
 /dist/
 /.device-auth/
+/.env
