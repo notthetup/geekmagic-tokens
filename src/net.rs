@@ -114,14 +114,19 @@ pub fn start(
         Ok(())
     })?;
 
-    server.fn_handler("/debug/pause", Method::Post, |req| -> Result<(), Box<dyn Error>> {
+    let pause_state = state.clone();
+    server.fn_handler("/debug/pause", Method::Post, move |req| -> Result<(), Box<dyn Error>> {
         if !authorized(&req) {
             return deny(req);
         }
-        let secs = query_secs(req.uri());
+        let secs = query(req.uri(), "secs");
+        let age = query(req.uri(), "age");
         codex::pause(secs);
+        if let Some(reading) = &mut pause_state.lock().unwrap().reading {
+            reading.at = reading.at.checked_sub(Duration::from_secs(age)).unwrap_or(reading.at);
+        }
         req.into_ok_response()?
-            .write_all(format!("Polling paused for {secs}s\n").as_bytes())?;
+            .write_all(format!("Polling paused for {secs}s, reading aged {age}s\n").as_bytes())?;
         Ok(())
     })?;
 
@@ -136,7 +141,7 @@ pub fn start(
         if !authorized(&req) {
             return deny(req);
         }
-        let secs = query_secs(req.uri());
+        let secs = query(req.uri(), "secs");
         req.into_ok_response()?
             .write_all(format!("Dropping Wi-Fi for {secs}s\n").as_bytes())?;
         thread::spawn(move || {
@@ -175,8 +180,12 @@ pub fn start(
     Ok(Net { ip, _wifi: wifi, _server: server, _reconnect: reconnect })
 }
 
-fn query_secs(uri: &str) -> u64 {
-    uri.split_once("secs=").and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
+fn query(uri: &str, key: &str) -> u64 {
+    let query = uri.split_once('?').map_or("", |(_, q)| q);
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+        .unwrap_or(0)
 }
 
 fn authorized(req: &Request<&mut EspHttpConnection>) -> bool {
